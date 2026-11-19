@@ -1,0 +1,642 @@
+---
+title: "¿Cuántos datos necesita un banco para prestarte?"
+author: "Kevin Arias Reyes"
+date: today
+date-format: "D [de] MMMM [de] YYYY"
+lang: es
+format:
+  pdf:
+    documentclass: article
+    papersize: letter
+    fontsize: 12pt
+    geometry: margin=2cm
+    number-sections: true
+    colorlinks: true
+    fig-pos: "H"
+    tbl-cap-location: top
+    include-in-header:
+      text: |
+        \usepackage{float}
+        \usepackage{booktabs}
+        \setlength{\parskip}{4pt}
+        \usepackage{titlesec}
+        \titleformat{\section}{\normalfont\bfseries\normalsize}{\thesection}{0.5em}{}
+        \titleformat{\subsection}{\normalfont\bfseries\normalsize}{\thesubsection}{0.5em}{}
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: preparacion
+#| include: false
+
+
+
+library(dplyr)
+library(ggplot2)
+library(modeldata)
+library(wooldridge)
+library(pROC)
+library(knitr)
+
+theme_set(theme_minimal(base_size = 10) +
+            theme(panel.grid.minor = element_blank(),
+                  plot.title.position = "plot"))
+rojo  <- "#C2410C"
+verde <- "#1D4ED8"
+
+# Formatos para los números dentro del texto
+f3  <- function(x) formatC(x, format = "f", digits = 3)
+pct <- function(x, d = 1) paste0(formatC(x, format = "f", digits = d), " %")
+
+# Ajusta una regresión logística con el entrenamiento y devuelve
+# el AUC sobre la prueba
+evaluar <- function(variables, objetivo, ent, pru) {
+  formula <- as.formula(paste(objetivo, "~", paste(variables, collapse = " + ")))
+  modelo  <- suppressWarnings(glm(formula, data = ent, family = binomial))
+  prob    <- predict(modelo, newdata = pru, type = "response")
+  as.numeric(auc(roc(pru[[objetivo]], prob, quiet = TRUE)))
+}
+
+semillas <- c(1, 7, 42, 99, 2026)
+```
+
+```{r}
+#| label: datos-lending-club
+#| include: false
+
+data(lending_club)
+lc <- lending_club |> mutate(malo = ifelse(Class == "bad", 1, 0))
+
+frecuentes <- lc |> count(addr_state) |> filter(n >= 100) |> pull(addr_state)
+lc <- lc |>
+  mutate(siglas = as.character(addr_state),
+         estado = factor(ifelse(siglas %in% frecuentes, siglas, "OTRO")))
+
+declaradas <- c("funded_amnt", "term", "estado", "annual_inc",
+                "emp_length", "verification_status")
+buro <- c("delinq_2yrs", "inq_last_6mths", "revol_util", "acc_now_delinq",
+          "open_il_6m", "open_il_12m", "open_il_24m", "total_bal_il",
+          "all_util", "inq_fi", "inq_last_12m", "delinq_amnt",
+          "num_il_tl", "total_il_high_credit_limit")
+sin_lugar <- setdiff(declaradas, "estado")
+
+n_lc    <- nrow(lc)
+n_malos <- sum(lc$malo)
+tasa    <- 100 * mean(lc$malo)
+```
+
+```{r}
+#| label: experimento-1
+#| include: false
+
+exp1 <- lapply(semillas, function(s) {
+  set.seed(s)
+  i <- sample(nrow(lc), floor(0.7 * nrow(lc)))
+  data.frame(
+    B     = evaluar(declaradas,              "malo", lc[i, ], lc[-i, ]),
+    A     = evaluar(c(declaradas, buro),     "malo", lc[i, ], lc[-i, ]),
+    B_sin = evaluar(sin_lugar,               "malo", lc[i, ], lc[-i, ]),
+    A_sin = evaluar(c(sin_lugar, buro),      "malo", lc[i, ], lc[-i, ]))
+}) |> bind_rows()
+
+auc1 <- colMeans(exp1)
+
+# Escalera de riesgo: en cada partición, el modelo ordena a la
+# gente de prueba de menor a mayor probabilidad de impago y la
+# parte en 5 grupos del mismo tamaño. Después se mira
+# cuánto impago real hubo en cada grupo. Un buen modelo deja el
+# impago concentrado en el grupo 5
+grupos_de_riesgo <- function(variables, objetivo, ent, pru) {
+  formula <- as.formula(paste(objetivo, "~", paste(variables, collapse = " + ")))
+  modelo  <- suppressWarnings(glm(formula, data = ent, family = binomial))
+  data.frame(grupo = ntile(predict(modelo, newdata = pru, type = "response"), 5),
+             real  = pru[[objetivo]])
+}
+
+escalera1 <- lapply(semillas, function(s) {
+  set.seed(s)
+  i <- sample(nrow(lc), floor(0.7 * nrow(lc)))
+  bind_rows(
+    grupos_de_riesgo(declaradas,          "malo", lc[i, ], lc[-i, ]) |>
+      mutate(modelo = "B: solo lo declarado"),
+    grupos_de_riesgo(c(declaradas, buro), "malo", lc[i, ], lc[-i, ]) |>
+      mutate(modelo = "A: declarado + buró"))
+}) |>
+  bind_rows() |>
+  group_by(modelo, grupo) |>
+  summarise(impago = 100 * mean(real), .groups = "drop") |>
+  mutate(modelo = factor(modelo, levels = c("B: solo lo declarado",
+                                            "A: declarado + buró")))
+
+# Valores para el texto
+esc <- function(m, g) escalera1$impago[escalera1$modelo == m & escalera1$grupo == g]
+A1 <- esc("A: declarado + buró", 1);  A5 <- esc("A: declarado + buró", 5)
+B1 <- esc("B: solo lo declarado", 1); B5 <- esc("B: solo lo declarado", 5)
+```
+
+```{r}
+#| label: ajuste
+#| include: false
+
+# Indicadores de ajuste: los modelos se estiman con toda la base
+ajustar <- function(v) suppressWarnings(
+  glm(as.formula(paste("malo ~", paste(v, collapse = " + "))),
+      data = lc, family = binomial))
+nulo <- glm(malo ~ 1, data = lc, family = binomial)
+
+# Hosmer-Lemeshow: 10 grupos por probabilidad estimada
+# compara impagos observados con esperados
+# Grados de libertad = 10 - 2.
+hosmer <- function(m) {
+  p <- fitted(m); y <- m$y; g <- ntile(p, 10)
+  O <- tapply(y, g, sum); E <- tapply(p, g, sum); n <- tapply(y, g, length)
+  chi <- sum((O - E)^2 / (E * (1 - E / n)))
+  pchisq(chi, df = 8, lower.tail = FALSE)
+}
+
+modelos <- list(B = ajustar(declaradas), A = ajustar(c(declaradas, buro)),
+                B_sin = ajustar(sin_lugar), A_sin = ajustar(c(sin_lugar, buro)))
+
+tabla_ajuste <- data.frame(
+  Modelo     = c("B: solo lo declarado", "A: declarado + buró",
+                 "B sin estado", "A sin estado"),
+  Parametros = sapply(modelos, function(m) length(coef(m))),
+  Devianza   = sapply(modelos, deviance),
+  AIC        = sapply(modelos, AIC),
+  R2         = sapply(modelos, function(m)
+                 1 - as.numeric(logLik(m)) / as.numeric(logLik(nulo))),
+  HL         = sapply(modelos, hosmer))
+dev_nula <- deviance(nulo)
+
+# Parámetros del mejor modelo (A sin estado): los siete más
+# significativos, con su razón de momios.
+coefs <- summary(modelos$A_sin)$coefficients
+coefs <- coefs[rownames(coefs) != "(Intercept)", ]
+coefs <- coefs[order(coefs[, "Pr(>|z|)"]), ][1:7, ]
+etiquetas <- c(
+  inq_last_6mths              = "Consultas de crédito en 6 meses (por consulta)",
+  verification_statusVerified = "Ingreso verificado por el prestamista",
+  open_il_12m                 = "Créditos a plazo abiertos en 12 meses (por crédito)",
+  inq_fi                      = "Consultas de entidades financieras (por consulta)",
+  num_il_tl                   = "Cuentas de crédito a plazo en total (por cuenta)",
+  all_util                    = "Uso de todas sus líneas de crédito (por punto porcentual)",
+  termterm_60                 = "Plazo de 60 meses en lugar de 36")
+tabla_param <- data.frame(
+  Variable = etiquetas[rownames(coefs)],
+  beta     = coefs[, "Estimate"],
+  OR       = exp(coefs[, "Estimate"]),
+  p        = coefs[, "Pr(>|z|)"])
+or_de <- function(v) exp(coef(modelos$A_sin)[v])
+```
+
+```{r}
+#| label: experimento-2
+#| include: false
+
+data(loanapp)
+la <- loanapp |>
+  mutate(appinc   = ifelse(appinc   == 666,       NA, appinc),
+         cototinc = ifelse(cototinc == 666,       NA, cototinc),
+         hexp     = ifelse(hexp %in% c(666, 999), NA, hexp),
+         gdlin    = ifelse(gdlin    == 666,       NA, gdlin),
+         term     = ifelse(term     >= 999999,    NA, term),
+         lines    = ifelse(lines    >= 999999,    NA, lines),
+         liq      = ifelse(liq      >= 1e6,       NA, liq))
+
+sensibles <- c("black", "hispan", "male", "married")
+neutras <- c("loanamt", "appinc", "atotinc", "cototinc", "hexp", "price",
+             "liq", "netw", "hrat", "obrat", "term", "self", "unem",
+             "chist", "mortg", "cons", "pubrec", "lines", "rep", "gdlin")
+d2 <- la[complete.cases(la[, c(neutras, sensibles)]), ]
+
+exp2 <- expand.grid(variable = sensibles, semilla = 1:10,
+                    stringsAsFactors = FALSE)
+exp2$auc <- mapply(function(v, s) {
+  set.seed(s)
+  i <- sample(nrow(d2), floor(0.7 * nrow(d2)))
+  evaluar(neutras, v, d2[i, ], d2[-i, ])
+}, exp2$variable, exp2$semilla)
+
+res2 <- exp2 |>
+  group_by(variable) |>
+  summarise(minimo = min(auc), maximo = max(auc), auc = mean(auc),
+            .groups = "drop")
+auc2 <- setNames(res2$auc, res2$variable)
+
+# La misma escalera, pero ahora el modelo ordena por probabilidad
+# de ser afrodescendiente, y se mira qué porcentaje de cada grupo
+# lo es de verdad
+escalera2 <- lapply(1:10, function(s) {
+  set.seed(s)
+  i <- sample(nrow(d2), floor(0.7 * nrow(d2)))
+  grupos_de_riesgo(neutras, "black", d2[i, ], d2[-i, ])
+}) |>
+  bind_rows() |>
+  group_by(grupo) |>
+  summarise(afro = 100 * mean(real), .groups = "drop")
+base_afro <- 100 * mean(d2$black)
+```
+
+```{r}
+#| label: experimento-3
+#| include: false
+
+cortes_cuantiles <- function(x, k) {
+  b <- unique(quantile(x, probs = seq(0, 1, length.out = k + 1)))
+  c(-Inf, b[-c(1, length(b))], Inf)
+}
+en_grupos <- function(x, cortes) {
+  factor(cut(x, breaks = cortes, labels = FALSE),
+         levels = seq_len(length(cortes) - 1))
+}
+con_tope  <- function(x, tope) factor(pmin(x, tope), levels = 0:tope)
+region_de <- function(s) {
+  r <- as.character(state.region[match(s, state.abb)])
+  r[s == "DC"] <- "South"
+  factor(r)
+}
+calcular_cortes <- function(e) {
+  list(ingreso = cortes_cuantiles(e$annual_inc, 10),
+       monto   = cortes_cuantiles(e$funded_amnt, 5),
+       saldo   = cortes_cuantiles(e$total_bal_il, 5),
+       limite  = cortes_cuantiles(e$total_il_high_credit_limit, 5))
+}
+porcentaje <- c(-Inf, 25, 50, 75, 100, Inf)
+agrupar <- function(d, ct) {
+  d |> mutate(
+    g_ingreso = en_grupos(annual_inc, ct$ingreso),
+    g_monto   = en_grupos(funded_amnt, ct$monto),
+    region    = region_de(siglas),
+    g_antig   = factor(case_when(
+      emp_length %in% c("emp_lt_1", "emp_1") ~ "menos de 2",
+      emp_length %in% c("emp_2", "emp_3", "emp_4") ~ "2 a 4",
+      emp_length %in% c("emp_5", "emp_6", "emp_7", "emp_8", "emp_9") ~ "5 a 9",
+      emp_length == "emp_ge_10" ~ "10 o más",
+      TRUE ~ "desconocida")),
+    g_saldo   = en_grupos(total_bal_il, ct$saldo),
+    g_limite  = en_grupos(total_il_high_credit_limit, ct$limite),
+    g_revol   = cut(revol_util, porcentaje),
+    g_util    = cut(all_util, porcentaje),
+    g_cuentas = cut(num_il_tl, c(-Inf, 3, 7, 12, 18, Inf)),
+    g_mora2   = con_tope(delinq_2yrs, 2),
+    g_moraHoy = con_tope(acc_now_delinq, 1),
+    g_consu6  = con_tope(inq_last_6mths, 3),
+    g_consu12 = con_tope(inq_last_12m, 5),
+    g_consuFi = con_tope(inq_fi, 3),
+    g_abre6   = con_tope(open_il_6m, 6),
+    g_abre12  = con_tope(open_il_12m, 2),
+    g_abre24  = con_tope(open_il_24m, 4),
+    g_enMora  = factor(ifelse(delinq_amnt > 0, "si", "no")))
+}
+agrupadas <- c("g_ingreso", "g_monto", "region", "term", "g_antig",
+               "verification_status", "g_saldo", "g_limite", "g_revol",
+               "g_util", "g_cuentas", "g_mora2", "g_moraHoy", "g_consu6",
+               "g_consu12", "g_consuFi", "g_abre6", "g_abre12", "g_abre24",
+               "g_enMora")
+
+exp3 <- lapply(semillas, function(s) {
+  set.seed(s)
+  i  <- sample(nrow(lc), floor(0.7 * nrow(lc)))
+  ct <- calcular_cortes(lc[i, ])
+  data.frame(crudo    = evaluar(c(declaradas, buro), "malo", lc[i, ], lc[-i, ]),
+             agrupado = evaluar(agrupadas, "malo",
+                                agrupar(lc[i, ], ct), agrupar(lc[-i, ], ct)))
+}) |> bind_rows()
+auc3 <- colMeans(exp3)
+dif3 <- exp3$agrupado - exp3$crudo
+
+unicidad <- function(d, ids) {
+  g <- d |> count(across(all_of(ids)), name = "k")
+  c(unicos = 100 * sum(g$k[g$k == 1]) / sum(g$k),
+    menos5 = 100 * sum(g$k[g$k < 5])  / sum(g$k))
+}
+lc_g <- agrupar(lc, calcular_cortes(lc))
+u_crudo <- unicidad(lc,   c("annual_inc", "funded_amnt", "siglas", "term", "emp_length"))
+u_grupo <- unicidad(lc_g, c("g_ingreso", "g_monto", "region", "term", "g_antig"))
+
+# ¿Entre cuántas personas se esconde cada solicitante? Para cada
+# persona add_count() cuenta cuántas comparten su combinación
+# de cinco datos (k), y luego se agrupa ese k en rangos
+tamano_grupo <- function(d, ids, etiqueta) {
+  d |>
+    add_count(across(all_of(ids)), name = "k") |>
+    mutate(rango = cut(k, c(0, 1, 4, 9, Inf),
+                       labels = c("Única", "2 a 4", "5 a 9", "10 o más"))) |>
+    count(rango, .drop = FALSE) |>
+    mutate(pct = 100 * n / sum(n), datos = etiqueta)
+}
+grupos3 <- bind_rows(
+  tamano_grupo(lc,   c("annual_inc", "funded_amnt", "siglas", "term", "emp_length"), "Exactos"),
+  tamano_grupo(lc_g, c("g_ingreso", "g_monto", "region", "term", "g_antig"), "Agrupados")
+) |>
+  mutate(datos = factor(datos, levels = c("Agrupados", "Exactos")))
+p10 <- grupos3$pct[grupos3$datos == "Agrupados" & grupos3$rango == "10 o más"]
+```
+
+# Introducción
+Las entidades financieras justifican la recolección y la compra de datos personales con un argumento: los necesitan para medir el riesgo. En Costa Rica, el Centro de Información Crediticia (CIC) de la SUGEF solo puede consultarse con autorización del titular, que vence a los seis meses, y deja registro de quién lo consultó; en paralelo, burós privados reúnen información que el CIC no ve, como deudas con tiendas, operadores telefónicos y financieras no reguladas.
+
+La Ley 8968, de Protección de la Persona frente al Tratamiento de sus Datos Personales, establece que los datos personales deben ser "adecuados al fin para el que fueron recolectados" (art. 6) y que transferirlos requiere autorización expresa del titular (art. 14). Esos principios suponen una pregunta empírica que rara vez se contesta: ¿cuánta información es realmente necesaria? Este trabajo la aborda con modelos de riesgo crediticio construidos en R.
+
+Hay además un segundo tema, el de la igualdad. La Constitución Política prohíbe toda discriminación contraria a la dignidad humana (art. 33), la CEDAW reconoce a las mujeres el derecho a obtener préstamos bancarios, hipotecas y otras formas de crédito en igualdad de condiciones (art. 13), la Ley 7935 incluye el acceso al crédito entre los derechos de las personas adultas mayores (art. 3) y la Ley 8968 prohíbe tratar datos que revelen el origen racial o étnico (art. 9). De estas normas se desprende que el sexo, la edad o la raza no deberían servir para tratar distinto a quien pide un crédito. Y la tentación existe: según la SUGEF, a setiembre de 2020 el 90 % del saldo prestado a mujeres estaba al día, frente al 86 % en el caso de los hombres. Como el banco no debe usar el sexo, la variable se deja fuera del modelo; la pregunta que queda abierta es qué pasa si el modelo logra deducirla a partir de otros datos permitidos. De eso trata el segundo experimento.
+
+# Objetivo
+
+Evaluar, a la luz de la Ley 8968, si los datos que los prestamistas obtienen de terceros son necesarios para predecir el impago de un crédito, si variables financieras aparentemente neutrales permiten reconstruir características sensibles como la raza o el sexo, y cuánto se pierde en capacidad predictiva al agrupar los datos para proteger la privacidad de los solicitantes.
+
+# Datos (insumos)
+
+No existe una base de crédito costarricense de acceso público, por lo que se usan dos bases de Estados Unidos incluidas en paquetes de R; el análisis normativo se refiere al marco costarricense (@tbl-datos, en el anexo).
+
+En `lending_club` la variable respuesta indica si el préstamo cayó en impago, lo que ocurre en `r format(n_malos, big.mark = " ")` casos (`r pct(tasa)`). Sus variables se separaron en tres grupos: 6 **declaradas** por el solicitante (monto, plazo, estado, ingreso, antigüedad laboral y verificación del ingreso), 14 provenientes del **buró** (moras, consultas de crédito, uso de líneas de crédito, saldos y límites) y 2 **excluidas** por fuga de información, la tasa de interés y la calificación que el propio prestamista asignó. Los estados con menos de 100 préstamos se agruparon en una categoría "otro".
+
+`loanapp` proviene del estudio de la Reserva Federal de Boston sobre discriminación hipotecaria y, a diferencia de casi todas las bases de crédito, incluye raza, sexo y estado civil. En ella se recodificaron como faltantes los códigos centinela (666, 999 999 y 1 000 000, que la base usa para "sin dato") y se conservaron las `r format(nrow(d2), big.mark = " ")` observaciones completas.
+
+# Metodología
+
+Los tres experimentos usan regresión logística, que estima la probabilidad de un evento a partir de las variables $x_1, \dots, x_k$:
+
+$$
+P(y = 1) = \frac{1}{1 + e^{-(\beta_0 + \beta_1 x_1 + \cdots + \beta_k x_k)}}
+$$
+
+Cada base se divide en 70 % de entrenamiento y 30 % de prueba. El desempeño se mide con el **AUC**: la probabilidad de que, al tomar al azar un caso positivo y uno negativo, el modelo asigne mayor probabilidad al positivo (0.5 equivale al azar y 1 a una clasificación perfecta). También se reporta el Gini, igual a $2 \times \text{AUC} - 1$. Como el resultado depende de la partición, cada medición se repite con cinco semillas, diez en el experimento 2 por ser la base más pequeña, y se reporta el promedio.
+
+Los indicadores de ajuste que acompañan al AUC (devianza, AIC, pseudo-R² de McFadden y prueba de Hosmer-Lemeshow) se explican en el anexo.
+
+- **Experimento 1.** Se compara el modelo B, con las 6 variables declaradas, con el modelo A, que suma las 14 del buró. Ambos se estiman también sin la variable de estado.
+- **Experimento 2.** Se invierte el problema: con 20 variables financieras y de historial crediticio se intenta predecir la raza, el sexo y el estado civil. Se excluyen las variables demográficas y las del vecindario. Un AUC mayor que 0.5 indica que la característica sensible puede reconstruirse.
+- **Experimento 3.** Las 20 variables del modelo A se reemplazan por versiones agrupadas: deciles o quintiles para montos, rangos para porcentajes, topes para conteos y región en lugar de estado. Los cortes se calculan solo con el entrenamiento para evitar fuga de información. Además se mide la **unicidad**: el porcentaje de personas cuya combinación de ingreso, monto, ubicación, plazo y antigüedad laboral no comparte nadie más en la base.
+
+# Resultados
+
+## Análisis exploratorio de datos
+
+El ingreso declarado casi no distingue a quienes pagan de quienes no: la tasa de impago se mueve entre 4.6 % y 5.7 % entre quintiles de ingreso. Las consultas de crédito de los últimos seis meses, un dato de buró, sí lo hacen: el impago pasa de 4.0 % sin consultas a 10.2 % con tres o más (@fig-aed). Esto anticipa que la información de terceros aporta, y que lo hace por el comportamiento crediticio más que por el nivel de ingreso.
+
+```{r}
+#| label: fig-aed
+#| fig-cap: "Tasa de impago según una variable declarada y una de buró. La línea punteada es la tasa general."
+#| fig-width: 6.5
+#| fig-height: 2.3
+
+aed <- bind_rows(
+  lc |> mutate(grupo = paste0("Q", ntile(annual_inc, 5))) |>
+    group_by(grupo) |> summarise(mora = 100 * mean(malo)) |>
+    mutate(panel = "Declarada: quintil de ingreso"),
+  lc |> mutate(grupo = ifelse(inq_last_6mths >= 3, "3+", as.character(inq_last_6mths))) |>
+    group_by(grupo) |> summarise(mora = 100 * mean(malo)) |>
+    mutate(panel = "Buró: consultas de crédito en 6 meses")
+) |> mutate(panel = factor(panel, levels = unique(panel)))
+
+ggplot(aed, aes(grupo, mora, fill = panel)) +
+  geom_col(width = 0.65) +
+  geom_hline(yintercept = tasa, linetype = "dashed", colour = "grey45") +
+  geom_text(aes(label = formatC(mora, format = "f", digits = 1)),
+            vjust = -0.4, size = 2.9) +
+  facet_wrap(~ panel, scales = "free_x") +
+  scale_fill_manual(values = c(verde, rojo), guide = "none") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(x = NULL, y = "Impago (%)") +
+  theme(strip.text = element_text(face = "bold"))
+```
+
+```{=latex}
+\vspace{-0.9em}\noindent{\footnotesize Fuente: elaboración propia con datos de Lending Club (Kuhn, 2024).}
+```
+
+## Resultados de la metodología
+
+**Experimento 1.** Agregar los 14 datos del buró sube el AUC de `r f3(auc1["B"])` a `r f3(auc1["A"])` (@tbl-exp1). La mejora es real pero acotada: incluso con toda la información, el modelo queda por debajo del rango típico de un modelo de crédito profesional (0.70 a 0.80). Además, la variable de estado empeora la predicción: al retirarla, el AUC del modelo A sube a `r f3(auc1["A_sin"])`. Con unos 360 impagos en entrenamiento, el modelo intenta estimar el riesgo de cada estado con una docena de casos y termina aprendiendo ruido (sobreajuste).
+
+```{r}
+#| label: tbl-exp1
+#| tbl-cap: "Experimento 1: capacidad predictiva según la información disponible"
+
+data.frame(
+  Modelo     = c("B: solo lo declarado", "A: declarado + buró",
+                 "B sin estado", "A sin estado"),
+  Variables  = c(6, 20, 5, 19),
+  AUC        = auc1[c("B", "A", "B_sin", "A_sin")],
+  Gini       = 2 * auc1[c("B", "A", "B_sin", "A_sin")] - 1
+) |>
+  kable(digits = 3, row.names = FALSE, booktabs = TRUE)
+```
+
+```{=latex}
+\vspace{-0.9em}\noindent{\footnotesize Fuente: elaboración propia con datos de Lending Club (Kuhn, 2024).}
+```
+
+La @fig-escalera traduce esa diferencia a algo concreto. Cada modelo ordena a los solicitantes de prueba de menor a mayor riesgo y los parte en cinco grupos del mismo tamaño; las barras muestran cuánto impago real hubo en cada grupo. Un buen modelo concentra el impago en el último grupo. Con el modelo A, el grupo de mayor riesgo tiene `r pct(A5)` de impago, cuatro veces el `r pct(A1)` del grupo más seguro; con el modelo B, la diferencia entre extremos es menos del doble (`r pct(B1)` frente a `r pct(B5)`). Esa escalera más empinada es lo que mide un AUC más alto.
+
+```{r}
+#| label: fig-escalera
+#| fig-cap: "Impago real en cada grupo de riesgo según el modelo. La línea punteada es la tasa general. Promedio de cinco particiones."
+#| fig-width: 6.5
+#| fig-height: 2.4
+
+ggplot(escalera1, aes(factor(grupo), impago, fill = modelo)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+  geom_hline(yintercept = tasa, linetype = "dashed", colour = "grey45") +
+  geom_text(aes(label = formatC(impago, format = "f", digits = 1)),
+            position = position_dodge(width = 0.75), vjust = -0.4, size = 2.8) +
+  scale_fill_manual(values = c(verde, rojo)) +
+  scale_x_discrete(labels = c("1\nmenor riesgo", "2", "3", "4", "5\nmayor riesgo")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(x = "Grupo de riesgo asignado por el modelo", y = "Impago real (%)", fill = NULL) +
+  theme(legend.position = "top", panel.grid.major.x = element_blank())
+```
+
+```{=latex}
+\vspace{-0.9em}\noindent{\footnotesize Fuente: elaboración propia con datos de Lending Club (Kuhn, 2024).}
+```
+
+Los indicadores de ajuste de estos modelos se comentan en el anexo (@tbl-ajuste).
+
+**Experimento 2.** Sin ver ninguna variable demográfica, el modelo identifica a los solicitantes afrodescendientes con un AUC de `r f3(auc2["black"])` (@tbl-exp2, en el anexo). Las variables que más lo delatan son el monto solicitado, la razón entre otras deudas e ingreso y el gasto en vivienda. Ninguna habla de raza; todas reflejan la desigualdad económica entre grupos, que queda grabada en los datos financieros.
+
+La @fig-proxy muestra qué significa ese AUC en la práctica. Se construye en tres pasos. Primero, el modelo le asigna a cada solicitante una probabilidad de ser afrodescendiente, calculada solo con sus datos financieros. Después, los solicitantes se ordenan de menor a mayor probabilidad y se forman cinco grupos del mismo tamaño. Por último, se revisa cuántos de cada grupo son realmente afrodescendientes.
+
+```{r}
+#| label: fig-proxy
+#| fig-cap: "Porcentaje real de solicitantes afrodescendientes en cada grupo, ordenados por el modelo usando solo datos financieros. La línea punteada es la proporción en toda la base. Promedio de diez particiones."
+#| fig-width: 6.5
+#| fig-height: 2.2
+
+ggplot(escalera2, aes(factor(grupo), afro)) +
+  geom_col(fill = rojo, width = 0.6) +
+  geom_hline(yintercept = base_afro, linetype = "dashed", colour = "grey45") +
+  geom_text(aes(label = formatC(afro, format = "f", digits = 1)),
+            vjust = -0.4, size = 2.8) +
+  scale_x_discrete(labels = c("1\nmenos probable", "2", "3", "4", "5\nmás probable")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(x = "Grupo según la probabilidad asignada por el modelo",
+       y = "Afrodescendientes (%)") +
+  theme(panel.grid.major.x = element_blank())
+```
+
+```{=latex}
+\vspace{-0.9em}\noindent{\footnotesize Fuente: elaboración propia con datos de Munnell et al. (1996).}
+```
+
+**Experimento 3.** Este experimento mide dos cosas al pasar de datos exactos a datos agrupados: lo que pierde el prestamista en capacidad de predecir y lo que gana el solicitante en privacidad (@tbl-exp3).
+
+Lo que pierde el prestamista es, en la práctica, nada. El AUC pasa de `r f3(auc3["crudo"])` con datos exactos a `r f3(auc3["agrupado"])` con datos agrupados. Esa pequeña diferencia no es una mejora real: al repetir el cálculo con distintas particiones, unas veces gana una versión y otras la otra (la diferencia va de `r sprintf("%+.3f", min(dif3))` a `r sprintf("%+.3f", max(dif3))`). Cuando el resultado cambia de signo según el sorteo, se dice que la diferencia está dentro del ruido.
+
+Lo que gana el solicitante es mucho. Una persona es **única** cuando nadie más en la base tiene su misma combinación de ingreso, monto, ubicación, plazo y antigüedad laboral. Aunque la base no tenga nombres, quien conozca esos cinco datos de alguien puede encontrar su fila y ver todo lo demás. Con los datos exactos, `r pct(u_crudo["unicos"])` de las personas son únicas; con los datos agrupados, solo `r pct(u_grupo["unicos"])`.
+
+```{r}
+#| label: tbl-exp3
+#| tbl-cap: "Experimento 3: capacidad predictiva y protección con datos exactos y agrupados"
+
+data.frame(
+  Datos = c("Exactos", "Agrupados"),
+  AUC   = f3(auc3[c("crudo", "agrupado")]),
+  `Personas únicas` = pct(c(u_crudo["unicos"], u_grupo["unicos"])),
+  `En grupos de menos de 5` = pct(c(u_crudo["menos5"], u_grupo["menos5"])),
+  check.names = FALSE
+) |>
+  kable(row.names = FALSE, booktabs = TRUE, align = "lrrr")
+```
+
+```{=latex}
+\vspace{-0.9em}\noindent{\footnotesize Fuente: elaboración propia con datos de Lending Club (Kuhn, 2024).}
+```
+
+La @fig-multitud muestra lo mismo para cada solicitante. Para cada persona se cuenta cuántas tienen exactamente sus mismos cinco datos, ella incluida, y se la ubica en una de cuatro barras según ese número. La barra naranja de la izquierda reúne a las personas únicas: son las identificables. Las barras azules reúnen a quienes comparten sus datos con otros: mientras más a la derecha, más gente con la que se confunde.
+
+Con los datos exactos, casi todos están en la barra naranja. Con los datos agrupados, la gente se mueve hacia la derecha: `r pct(p10)` queda en un grupo de diez personas o más con los mismos cinco datos, así que, aunque alguien los conozca, no puede saber cuál de esas filas es la suya.
+
+```{r}
+#| label: fig-multitud
+#| fig-cap: "Porcentaje de solicitantes según cuántas personas tienen su misma combinación de ingreso, monto, ubicación, plazo y antigüedad laboral. Naranja: personas únicas, identificables."
+#| fig-width: 6.5
+#| fig-height: 2.9
+
+naranja <- "#C2410C"   # identificable
+azul    <- "#1D4ED8"   # protegido
+# Pareja azul-naranja: distinguible con los tipos comunes de daltonismo.
+# El color no es la única pista: la posición y el texto dicen lo mismo.
+
+grupos3 |>
+  mutate(datos = factor(datos, levels = c("Exactos", "Agrupados"),
+                        labels = c("Datos exactos", "Datos agrupados")),
+         identificable = rango == "Única") |>
+  ggplot(aes(x = rango, y = pct, fill = identificable)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = pct(pct, 1)), vjust = -0.45, size = 3.6,
+            fontface = "bold", colour = "grey15") +
+  facet_wrap(~ datos) +
+  scale_fill_manual(values = c(`TRUE` = naranja, `FALSE` = azul), guide = "none") +
+  scale_x_discrete(labels = c("Única\n(1 persona)", "2 a 4", "5 a 9", "10 o más")) +
+  scale_y_continuous(limits = c(0, 112), breaks = seq(0, 100, 25),
+                     labels = function(x) paste0(x, " %"),
+                     expand = expansion(mult = c(0, 0))) +
+  labs(x = "Personas con la misma combinación de cinco datos",
+       y = "Solicitantes") +
+  theme_minimal(base_size = 11.5) +
+  theme(strip.text = element_text(face = "bold", size = 12.5),
+        axis.text = element_text(colour = "grey15"),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.spacing = unit(1.5, "lines"))
+```
+
+```{=latex}
+\vspace{-0.9em}\noindent{\footnotesize Fuente: elaboración propia con datos de Lending Club (Kuhn, 2024).}
+```
+
+# Referencias {.unnumbered}
+
+```{=latex}
+\begingroup\small
+```
+
+Asamblea Legislativa de Costa Rica (2011). *Ley 8968: Protección de la Persona frente al Tratamiento de sus Datos Personales*.
+
+Asamblea Legislativa de Costa Rica (1999). *Ley 7935: Ley Integral para la Persona Adulta Mayor*.
+
+Asamblea Nacional Constituyente (1949). *Constitución Política de la República de Costa Rica*, artículo 33.
+
+Hosmer, D. W. y Lemeshow, S. (2000). *Applied Logistic Regression* (2.ª ed.). Wiley.
+
+Kuhn, M. (2024). *modeldata: Data Sets Useful for Modeling Examples*. Paquete de R.
+
+Munnell, A. H., Tootell, G. M. B., Browne, L. E. y McEneaney, J. (1996). Mortgage Lending in Boston: Interpreting HMDA Data. *American Economic Review*, 86(1), 25–53.
+
+Naciones Unidas (1979). *Convención sobre la Eliminación de Todas las Formas de Discriminación contra la Mujer*, artículo 13.
+
+Robin, X. et al. (2011). pROC: an open-source package for R and S+ to analyze and compare ROC curves. *BMC Bioinformatics*, 12, 77.
+
+Superintendencia General de Entidades Financieras (2023). *Preguntas frecuentes sobre el Centro de Información Crediticia*.
+
+Superintendencia General de Entidades Financieras (s. f.). *II Informe de Brechas Financieras*. Datos a setiembre de 2020.
+
+
+```{=latex}
+\endgroup
+```
+
+\newpage
+
+# Anexo {.unnumbered}
+
+## A. Fuentes de datos {.unnumbered}
+
+| Base | Paquete | Filas | Contenido | Uso |
+|:-----------------|:-----------|-------:|:--------------------------------------|:-----------------|
+| `lending_club` | `modeldata` | 9 857 | Préstamos de Lending Club, primer trimestre de 2016 | Experimentos 1 y 3 |
+| `loanapp` | `wooldridge` | 1 989 | Solicitudes de hipoteca en Boston, 1990 | Experimento 2 |
+
+: Fuentes de datos {#tbl-datos}
+
+```{=latex}
+\vspace{-0.9em}\noindent{\footnotesize Fuente: elaboración propia.}
+```
+
+## B. Indicadores de ajuste {.unnumbered}
+
+Conviene distinguir entre los **parámetros** del modelo y los **indicadores de ajuste**. Los parámetros son los coeficientes $\beta$, que R estima por máxima verosimilitud: busca los valores que hacen más probable haber observado los datos que se tienen. Los indicadores de ajuste, en cambio, dicen qué tan bien funciona el modelo en su conjunto. El AUC mide la **discriminación**, es decir, si el modelo ordena bien a las personas de menor a mayor riesgo. Para el ajuste a los datos se usan la **devianza**, que es menor cuanto mejor se ajusta el modelo; el **AIC**, que suma a la devianza una penalización de dos puntos por cada parámetro y sirve para comparar modelos de distinto tamaño (gana el menor); el **pseudo-R² de McFadden**, que indica qué fracción de la devianza del modelo sin variables se logra explicar; y la prueba de **Hosmer-Lemeshow**, que divide a las personas en diez grupos según su probabilidad estimada y compara los impagos esperados con los observados. En esta última, un valor p mayor que 0.05 significa que no hay evidencia de que las probabilidades estén mal calibradas.
+
+El AUC dice qué tan bien ordena cada modelo, pero no si sus probabilidades son razonables ni si el número de parámetros se justifica. Para eso está la @tbl-ajuste, que estima los cuatro modelos con toda la base. Las cuatro devianzas quedan por debajo de la del modelo sin variables (`r formatC(dev_nula, format = "f", digits = 1)`), pero el pseudo-R² muestra que ninguno explica mucho: el más alto llega apenas a `r formatC(tabla_ajuste$R2[2], format = "f", digits = 3)`. Esto es habitual en modelos de crédito, donde el impago depende en buena parte de cosas que ninguna base registra, como perder el empleo o enfermarse. Ese valor más alto corresponde al modelo A con estado, y no es casualidad: dentro de la misma base, agregar parámetros siempre baja un poco la devianza, aunque sea aprendiendo ruido. Por eso se usa el AIC, que cobra por cada parámetro. Con él, el modelo preferido es el A sin estado, porque los 29 parámetros que agrega la variable de estado bajan la devianza menos de lo que cuestan, lo mismo que ya había mostrado el AUC en los datos de prueba. Por último, en los cuatro casos la prueba de Hosmer-Lemeshow da un valor p mayor que 0.05, así que no hay evidencia de que las probabilidades estimadas se alejen de las tasas de impago observadas.
+
+```{r}
+#| label: tbl-ajuste
+#| tbl-cap: "Indicadores de ajuste de los modelos del experimento 1, estimados con toda la base"
+
+tabla_ajuste |>
+  transmute(Modelo,
+            `Parámetros` = Parametros,
+            Devianza = formatC(Devianza, format = "f", digits = 1),
+            AIC = formatC(AIC, format = "f", digits = 1),
+            `Pseudo-R² McFadden` = f3(R2),
+            `Hosmer-Lemeshow (valor p)` = f3(HL)) |>
+  kable(row.names = FALSE, booktabs = TRUE, align = "lrrrrr")
+```
+
+```{=latex}
+\vspace{-0.9em}\noindent{\footnotesize Fuente: elaboración propia con datos de Lending Club (Kuhn, 2024).}
+```
+
+## C. Experimento 2 {.unnumbered}
+
+```{r}
+#| label: tbl-exp2
+#| tbl-cap: "AUC al predecir características sensibles con 20 variables financieras"
+
+nombres <- c(black = "Ser afrodescendiente", male = "Ser hombre",
+             married = "Estar casado", hispan = "Ser hispano")
+res2 |>
+  arrange(desc(auc)) |>
+  transmute(`Característica` = nombres[variable],
+            `AUC promedio` = auc,
+            `Rango en 10 particiones` = paste(f3(minimo), "a", f3(maximo))) |>
+  kable(digits = 3, row.names = FALSE, booktabs = TRUE)
+```
+
+```{=latex}
+\vspace{-0.9em}\noindent{\footnotesize Fuente: elaboración propia con datos de Munnell et al. (1996).}
+```
